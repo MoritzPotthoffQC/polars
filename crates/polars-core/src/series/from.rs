@@ -677,6 +677,25 @@ fn convert<F: Fn(&dyn Array) -> ArrayRef>(arr: &[ArrayRef], f: F) -> Vec<ArrayRe
     arr.iter().map(|arr| f(&**arr)).collect()
 }
 
+/// Converts each array on its own through `f`, so the output has exactly one
+/// physical array per input array. Nested list conversion depends on this to
+/// pair the converted values with the original offsets.
+fn convert_each(
+    arrays: Vec<ArrayRef>,
+    mut f: impl FnMut(ArrayRef) -> PolarsResult<Series>,
+) -> PolarsResult<(Vec<ArrayRef>, DataType)> {
+    let mut dtype = None;
+    let chunks = arrays
+        .into_iter()
+        .map(|arr| {
+            let s = f(arr)?.rechunk();
+            dtype.get_or_insert_with(|| s.dtype().clone());
+            Ok(s.chunks()[0].clone())
+        })
+        .collect::<PolarsResult<Vec<_>>>()?;
+    Ok((chunks, dtype.unwrap()))
+}
+
 /// Normalize the field names of one chunk of map entries. Only the names change, so the
 /// buffers stay valid.
 #[cfg(feature = "dtype-map")]
@@ -709,22 +728,26 @@ unsafe fn to_physical_and_dtype(
             Ok((chunks, DataType::Binary))
         },
         #[allow(unused_variables)]
-        dt @ ArrowDataType::Dictionary(_, _, _) => {
+        dt @ ArrowDataType::Dictionary(key_type, _, _) => {
             feature_gated!("dtype-categorical", {
-                let s = unsafe {
-                    let dt = dt.clone();
-                    Series::_try_from_arrow_unchecked_with_md(PlSmallStr::EMPTY, arrays, &dt, md)
-                }?;
-                Ok((s.chunks().clone(), s.dtype().clone()))
+                let key_type = *key_type;
+                let polars_dtype = DataType::from_arrow(dt, md);
+                convert_each(arrays, |arr| unsafe {
+                    import_arrow_dictionary_array(
+                        PlSmallStr::EMPTY,
+                        arr,
+                        &key_type,
+                        &polars_dtype,
+                    )
+                })
             })
         },
         dt @ ArrowDataType::Extension(_) => {
             feature_gated!("dtype-extension", {
-                let s = unsafe {
-                    let dt = dt.clone();
-                    Series::_try_from_arrow_unchecked_with_md(PlSmallStr::EMPTY, arrays, &dt, md)
-                }?;
-                Ok((s.chunks().clone(), s.dtype().clone()))
+                let dt = dt.clone();
+                convert_each(arrays, |arr| unsafe {
+                    Series::_try_from_arrow_unchecked_with_md(PlSmallStr::EMPTY, vec![arr], &dt, md)
+                })
             })
         },
         ArrowDataType::List(field) => {
@@ -745,6 +768,7 @@ unsafe fn to_physical_and_dtype(
 
             let (converted_values, dtype) =
                 to_physical_and_dtype(values, field.metadata.as_deref())?;
+            debug_assert_eq!(converted_values.len(), arrays.len());
 
             let arrays = arrays
                 .iter()
@@ -753,14 +777,14 @@ unsafe fn to_physical_and_dtype(
                     let arr = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
                     let dtype = FixedSizeListArray::default_datatype(values.dtype().clone(), *size);
-                    Box::from(FixedSizeListArray::new(
+                    Ok(Box::from(FixedSizeListArray::try_new(
                         dtype,
                         arr.len(),
                         values,
                         arr.validity().cloned(),
-                    )) as ArrayRef
+                    )?) as ArrayRef)
                 })
-                .collect();
+                .collect::<PolarsResult<_>>()?;
             Ok((arrays, DataType::Array(Box::new(dtype), *size)))
         },
         ArrowDataType::LargeList(field) => {
@@ -774,6 +798,7 @@ unsafe fn to_physical_and_dtype(
 
             let (converted_values, dtype) =
                 to_physical_and_dtype(values, field.metadata.as_deref())?;
+            debug_assert_eq!(converted_values.len(), arrays.len());
 
             let arrays = arrays
                 .iter()
@@ -782,14 +807,14 @@ unsafe fn to_physical_and_dtype(
                     let arr = arr.as_any().downcast_ref::<ListArray<i64>>().unwrap();
 
                     let dtype = ListArray::<i64>::default_datatype(values.dtype().clone());
-                    Box::from(ListArray::<i64>::new(
+                    Ok(Box::from(ListArray::<i64>::try_new(
                         dtype,
                         arr.offsets().clone(),
                         values,
                         arr.validity().cloned(),
-                    )) as ArrayRef
+                    )?) as ArrayRef)
                 })
-                .collect();
+                .collect::<PolarsResult<_>>()?;
             Ok((arrays, DataType::List(Box::new(dtype))))
         },
         ArrowDataType::Struct(_fields) => {
@@ -845,9 +870,9 @@ unsafe fn to_physical_and_dtype(
         | ArrowDataType::Date64
         | ArrowDataType::Map(_, _)) => {
             let dt = dt.clone();
-            let mut s = Series::_try_from_arrow_unchecked(PlSmallStr::EMPTY, arrays, &dt)?;
-            let dtype = s.dtype().clone();
-            Ok((std::mem::take(s.chunks_mut()), dtype))
+            convert_each(arrays, |arr| unsafe {
+                Series::_try_from_arrow_unchecked(PlSmallStr::EMPTY, vec![arr], &dt)
+            })
         },
         dt => {
             let dtype = DataType::from_arrow(dt, md);
@@ -1188,5 +1213,123 @@ mod tests {
         let s = Series::from_arrow(PlSmallStr::EMPTY, array.boxed()).unwrap();
         assert_eq!(s.dtype(), &DataType::Time);
         assert_eq!(s.to_physical_repr().i64().unwrap().get(0), Some(7_000_000));
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "dtype-categorical")]
+mod nested_dictionary_tests {
+    use polars_arrow::array::LIST_VALUES_NAME;
+
+    use super::*;
+
+    /// A dictionary array holding `values` as `dtype`, plus the list item field for it.
+    fn dictionary(values: &[&str], dtype: &DataType) -> (ArrayRef, ArrowField) {
+        let s = Series::new(PlSmallStr::EMPTY, values).cast(dtype).unwrap();
+        let field = dtype.to_arrow_field(LIST_VALUES_NAME, CompatLevel::newest());
+        (s.to_arrow(0, CompatLevel::newest()), field)
+    }
+
+    /// A single-row large list array holding `values` as `dtype`.
+    fn list_chunk(values: &[&str], dtype: &DataType) -> ArrayRef {
+        let (dict, field) = dictionary(values, dtype);
+        let offsets = OffsetsBuffer::try_from(vec![0i64, values.len() as i64]).unwrap();
+        ListArray::<i64>::new(
+            ArrowDataType::LargeList(Box::new(field)),
+            offsets,
+            dict,
+            None,
+        )
+        .boxed()
+    }
+
+    fn import(chunks: Vec<ArrayRef>) -> Series {
+        let dtype = chunks[0].dtype().clone();
+        unsafe {
+            Series::_try_from_arrow_unchecked_with_md(PlSmallStr::EMPTY, chunks, &dtype, None)
+        }
+        .unwrap()
+    }
+
+    fn rows(s: &Series) -> Vec<Vec<String>> {
+        let s = s.cast(&DataType::List(Box::new(DataType::String))).unwrap();
+        let ca = s.list().unwrap();
+        (0..ca.len())
+            .map(|i| {
+                let row = ca.get_as_series(i).unwrap();
+                row.str()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .map(String::from)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_roundtrip(rows_in: &[&[&str]], dtype: &DataType) {
+        let chunks = rows_in.iter().map(|r| list_chunk(r, dtype)).collect();
+        let s = import(chunks);
+        assert_eq!(s.dtype(), &DataType::List(Box::new(dtype.clone())));
+        assert_eq!(s.len(), rows_in.len());
+        assert_eq!(s.n_chunks(), rows_in.len());
+        let expected: Vec<Vec<String>> = rows_in
+            .iter()
+            .map(|r| r.iter().map(|v| v.to_string()).collect())
+            .collect();
+        assert_eq!(rows(&s), expected);
+    }
+
+    fn categorical() -> DataType {
+        DataType::from_categories(Categories::global())
+    }
+
+    #[test]
+    fn large_list_of_dictionary_keeps_empty_value_chunks() {
+        assert_roundtrip(&[&["a"], &[], &["b", "c", "d"], &["e"]], &categorical());
+    }
+
+    #[test]
+    fn large_list_of_dictionary_keeps_leading_empty_value_chunk() {
+        assert_roundtrip(&[&[], &["a"], &["b", "c"]], &categorical());
+    }
+
+    #[test]
+    fn large_list_of_dictionary_keeps_rows_with_matching_lengths() {
+        // The value chunk lengths still fit the offsets after dropping the empty
+        // one, so a misalignment here would silently produce wrong rows.
+        assert_roundtrip(&[&["a"], &[], &["b"]], &categorical());
+    }
+
+    #[test]
+    fn large_list_of_enum_keeps_empty_value_chunks() {
+        let fcats = FrozenCategories::new(["a", "b", "c", "d", "e"]).unwrap();
+        let dtype = DataType::from_frozen_categories(fcats);
+        assert_roundtrip(&[&["a"], &[], &["b", "c", "d"], &["e"]], &dtype);
+    }
+
+    #[test]
+    #[cfg(feature = "dtype-array")]
+    fn fixed_size_list_of_dictionary_keeps_empty_chunks() {
+        let dtype = categorical();
+        let rows_in: &[&[&str]] = &[&["a"], &[], &["b", "c"]];
+        let chunks = rows_in
+            .iter()
+            .map(|values| {
+                let (dict, field) = dictionary(values, &dtype);
+                FixedSizeListArray::new(
+                    ArrowDataType::FixedSizeList(Box::new(field), 1),
+                    values.len(),
+                    dict,
+                    None,
+                )
+                .boxed()
+            })
+            .collect();
+        let s = import(chunks);
+        assert_eq!(s.dtype(), &DataType::Array(Box::new(dtype), 1));
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.n_chunks(), 3);
+        let expected: Vec<Vec<String>> = ["a", "b", "c"].map(|v| vec![v.to_string()]).into();
+        assert_eq!(rows(&s), expected);
     }
 }
